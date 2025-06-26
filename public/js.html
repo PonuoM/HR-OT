@@ -1,0 +1,544 @@
+<script>
+    let currentUser = {}; 
+    let sessionToken = null;
+    let allUserNotifications = [];
+    let allLeaveTypes = [];
+    let hrManagementDataCache = null;
+    let historyCache = null;
+    let dashboardDataStore = {};
+
+    let calendarDate = new Date();
+    const monthNames = ["มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน", "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม"];
+
+    document.addEventListener('DOMContentLoaded', () => {
+        applyInitialTheme();
+        setupCopyright();
+
+        const storedToken = localStorage.getItem('leaveAppSessionToken');
+        if (storedToken) {
+            showSpinner();
+            google.script.run
+                .withSuccessHandler(onLoginSuccess)
+                .withFailureHandler(() => { 
+                    hideSpinner();
+                    localStorage.removeItem('leaveAppSessionToken');
+                    document.getElementById('login-view').style.display = 'flex';
+                 })
+                .checkUserSession(storedToken);
+        } else {
+            document.getElementById('login-view').style.display = 'flex';
+        }
+        const passwordInput = document.getElementById('password');
+        passwordInput.addEventListener('keypress', e => { if (e.key === 'Enter') handleLogin(); });
+    });
+
+    function applyInitialTheme() {
+        const savedTheme = localStorage.getItem('theme') || 'dark';
+        if (savedTheme === 'light') {
+            document.body.classList.add('light-mode');
+            document.getElementById('theme-toggle-desktop').checked = true;
+            document.getElementById('theme-toggle-mobile').checked = true;
+        }
+    }
+
+    function toggleTheme(event) {
+        const isChecked = event.target.checked;
+        if (isChecked) {
+            document.body.classList.add('light-mode');
+            localStorage.setItem('theme', 'light');
+        } else {
+            document.body.classList.remove('light-mode');
+            localStorage.setItem('theme', 'dark');
+        }
+        document.getElementById('theme-toggle-desktop').checked = isChecked;
+        document.getElementById('theme-toggle-mobile').checked = isChecked;
+    }
+    
+    function setupCopyright() {
+        const year = new Date().getFullYear();
+        const copyrightElement = document.getElementById('copyright-text');
+        if (copyrightElement) {
+            copyrightElement.innerHTML = `© ${year} by Thanu Suriwong`;
+        }
+    }
+    
+    function handleLogin() {
+        const username = document.getElementById('username').value;
+        const password = document.getElementById('password').value;
+        const loginButton = document.querySelector('.login-btn');
+        const loginError = document.getElementById('login-error');
+
+        if (!username || !password) {
+            loginError.textContent = "กรุณากรอกชื่อผู้ใช้และรหัสผ่าน"; return;
+        }
+
+        loginButton.disabled = true;
+        loginButton.innerHTML = `<div class="button-spinner"></div> กำลังตรวจสอบ...`;
+        loginError.textContent = "";
+        
+        google.script.run
+            .withSuccessHandler(onLoginSuccess)
+            .withFailureHandler(onLoginFailure)
+            .loginUser(username, password);
+    }
+    
+    function onLoginSuccess(response) {
+        hideSpinner();
+        if (response && response.isLoggedIn) {
+            currentUser = response.user;
+            sessionToken = response.sessionToken;
+            localStorage.setItem('leaveAppSessionToken', sessionToken);
+            
+            document.getElementById('login-view').style.display = 'none';
+            document.getElementById('app-layout').style.display = 'flex';
+            
+            document.getElementById('user-fullname').textContent = currentUser.fullName;
+            document.getElementById('greeting-icon').className = `fas fa-${currentUser.role === 'HR' ? 'user-shield' : currentUser.role === 'Manager' || currentUser.role === 'Supervisor' ? 'user-tie' : 'user'}`;
+            
+            const hrButton = document.getElementById('btn-hrPanel');
+            const hrButtonMobile = document.getElementById('btn-mobile-hrPanel');
+            if (currentUser.role === 'HR') {
+                hrButton.style.display = 'flex';
+                hrButtonMobile.style.display = 'flex';
+            } else {
+                hrButton.style.display = 'none';
+                hrButtonMobile.style.display = 'none';
+            }
+            
+            setupEventListeners();
+            loadInitialData();
+        } else {
+            onLoginFailure({ message: response.error || "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง" });
+        }
+    }
+    
+    function onLoginFailure(error) {
+        hideSpinner();
+        const loginButton = document.querySelector('.login-btn');
+        const loginError = document.getElementById('login-error');
+        loginButton.disabled = false;
+        loginButton.innerHTML = 'เข้าสู่ระบบ';
+        loginError.textContent = error.message;
+    }
+    
+    function setupEventListeners() {
+        const sidebar = document.querySelector('.sidebar');
+        const appLayout = document.getElementById('app-layout');
+        if (sidebar && appLayout) {
+          sidebar.addEventListener('mouseenter', () => appLayout.classList.add('sidebar-expanded'));
+          sidebar.addEventListener('mouseleave', () => appLayout.classList.remove('sidebar-expanded'));
+        }
+
+        const startDateInput = document.getElementById('start-date');
+        const endDateInput = document.getElementById('end-date');
+
+        startDateInput.addEventListener('change', () => {
+            const startDate = startDateInput.value;
+            if (startDate) {
+                endDateInput.min = startDate;
+                
+                if (endDateInput.value && endDateInput.value < startDate) {
+                    endDateInput.value = startDate;
+                    Swal.fire({ icon: 'warning', title: 'ปรับวันที่อัตโนมัติ', text: 'ระบบได้ปรับวันสิ้นสุดให้ตรงกับวันเริ่มต้น เนื่องจากวันสิ้นสุดที่เลือกไว้มาก่อนวันเริ่มต้น', timer: 3000, showConfirmButton: false });
+                }
+            }
+        });
+
+        endDateInput.addEventListener('change', () => {
+            const endDate = endDateInput.value;
+            const startDate = startDateInput.value;
+            
+            if (endDate && !startDate) { startDateInput.value = endDate; }
+            else if (endDate && startDate && endDate < startDate) {
+                endDateInput.value = startDate;
+                Swal.fire({ icon: 'warning', title: 'วันที่ไม่ถูกต้อง', text: 'วันสิ้นสุดต้องไม่มาก่อนวันเริ่มต้น', timer: 2000, showConfirmButton: false });
+            }
+        });
+
+        document.getElementById('leave-type').addEventListener('change', updateLeaveBalanceDisplay);
+        document.getElementById('role-filter').addEventListener('change', applyHRFilters);
+        document.getElementById('department-filter').addEventListener('change', applyHRFilters);
+        
+        document.getElementById('theme-toggle-desktop').addEventListener('change', toggleTheme);
+        document.getElementById('theme-toggle-mobile').addEventListener('change', toggleTheme);
+    }
+    
+    function loadInitialData(forceRefresh = false) {
+        showSpinner();
+        
+        if (forceRefresh) {
+            dashboardDataStore = {};
+            historyCache = null;
+            hrManagementDataCache = null;
+        }
+
+        google.script.run.withSuccessHandler(response => {
+            hideSpinner();
+            if(response.error){ Swal.fire('เกิดข้อผิดพลาด', response.error, 'error'); return; }
+            dashboardDataStore = response;
+            renderDashboard(dashboardDataStore);
+        }).withFailureHandler(err => { hideSpinner(); Swal.fire('ผิดพลาดรุนแรง', err.message, 'error'); }).getDashboardData(sessionToken);
+
+        google.script.run.withSuccessHandler(response => {
+            if(response.success){ allLeaveTypes = response.types; populateLeaveTypeDropdown(); }
+        }).getLeaveTypes(sessionToken);
+        
+        google.script.run.withSuccessHandler(renderNotificationsBadge).getAllNotifications(sessionToken);
+    }
+
+    function populateLeaveTypeDropdown(){
+        const select = document.getElementById('leave-type');
+        select.innerHTML = '';
+        allLeaveTypes.forEach(type => { select.innerHTML += `<option value="${type.id}">${type.name}</option>`; });
+        updateLeaveBalanceDisplay();
+    }
+    
+    function renderDashboard(data){
+        const balanceDiv = document.getElementById('leave-balance');
+        const balances = [
+            { label: 'พักร้อน', ...data.leaveBalance.LT003 }, { label: 'ลากิจ', ...data.leaveBalance.LT002 }, { label: 'ลาป่วย', ...data.leaveBalance.LT001 }
+        ];
+        balanceDiv.innerHTML = balances.map(b => `
+            <div class="leave-balance-item">
+                <div class="label">${b.label}</div> <div class="value">${b.quota - b.used}</div> <div class="details">ใช้ไป ${b.used} จาก ${b.quota} วัน</div>
+            </div>`).join('');
+
+        const adminView = document.getElementById('admin-dashboard-view');
+        adminView.style.display = 'none';
+        const isAdmin = currentUser.role === 'HR' || currentUser.role === 'Manager' || currentUser.role === 'Supervisor';
+        if (isAdmin) {
+            const tasks = data.managerTasks;
+            const approvalDiv = document.getElementById('dashboard-approval-tasks');
+            if (tasks && tasks.length > 0) {
+                adminView.style.display = 'block';
+                approvalDiv.innerHTML = '';
+                tasks.forEach(task => { approvalDiv.appendChild(createApprovalCard(task)); });
+            } else {
+                adminView.style.display = 'none';
+            }
+        }
+        
+        document.getElementById('dashboard-leave-summary').innerHTML = createUsedLeaveSummary(data.usedLeaveSummary);
+        renderCalendar(calendarDate.getFullYear(), calendarDate.getMonth(), data.calendarEvents);
+    }
+
+    function createUsedLeaveSummary(summaryData) {
+        if (!summaryData || summaryData.length === 0) { return '<div class="empty-state"><i class="fas fa-box-open fa-2x"></i><p>ยังไม่มีการใช้วันลา</p></div>'; }
+        let listHTML = '<ul class="summary-list">';
+        summaryData.forEach(item => { listHTML += `<li class="summary-item"><span>${item.typeName}</span><span class="days">${item.totalDays} วัน</span></li>`; });
+        listHTML += '</ul>';
+        return listHTML;
+    }
+
+    function renderCalendar(year, month, events = []) {
+        const calendarBody = document.getElementById('calendar-body');
+        const monthYearText = document.getElementById('month-year');
+        calendarBody.innerHTML = '';
+        monthYearText.textContent = `${monthNames[month]} ${year + 543}`;
+        const firstDay = new Date(year, month, 1).getDay();
+        const daysInMonth = new Date(year, month + 1, 0).getDate();
+        const startDay = (firstDay === 0) ? 6 : firstDay - 1; 
+        for (let i = 0; i < startDay; i++) { calendarBody.innerHTML += `<div class="day-cell other-month"></div>`; }
+        const today = new Date();
+        for (let day = 1; day <= daysInMonth; day++) {
+            const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+            const dayEvents = events.filter(e => e.date === dateStr);
+            let cellClass = 'day-cell';
+            if (year === today.getFullYear() && month === today.getMonth() && day === today.getDate()) { cellClass += ' today'; }
+            let clickHandler = '';
+            if (dayEvents.length > 0) { cellClass += ' has-event'; clickHandler = `onclick="showCalendarDetails('${dateStr}')"`; }
+            calendarBody.innerHTML += `<div class="${cellClass}" ${clickHandler}>${day}</div>`;
+        }
+    }
+
+    function prevMonth() { calendarDate.setMonth(calendarDate.getMonth() - 1); renderCalendar(calendarDate.getFullYear(), calendarDate.getMonth(), dashboardDataStore.calendarEvents); }
+    function nextMonth() { calendarDate.setMonth(calendarDate.getMonth() + 1); renderCalendar(calendarDate.getFullYear(), calendarDate.getMonth(), dashboardDataStore.calendarEvents); }
+    function showCalendarDetails(dateStr) { const events = dashboardDataStore.calendarEvents.filter(e => e.date === dateStr); const modalBody = document.getElementById('calendar-details-body'); const modalDate = document.getElementById('calendar-details-date'); const d = new Date(dateStr + 'T00:00:00'); modalDate.textContent = `วันที่ ${d.getDate()} ${monthNames[d.getMonth()]} ${d.getFullYear() + 543}`; if (events.length > 0) { modalBody.innerHTML = events.map(e => `<div class="detail-item"><span class="employee-name">${e.employeeName}</span><span class="leave-type">${e.leaveType}</span></div>`).join(''); } else { modalBody.innerHTML = '<p>ไม่มีข้อมูล</p>'; } document.getElementById('calendar-details-modal').style.display = 'flex'; }
+    function closeCalendarDetailsModal() { document.getElementById('calendar-details-modal').style.display = 'none'; }
+    function updateLeaveBalanceDisplay(){ const selectedTypeId = document.getElementById('leave-type').value; const balanceInput = document.getElementById('leave-type-balance'); if (dashboardDataStore && dashboardDataStore.leaveBalance && dashboardDataStore.leaveBalance[selectedTypeId]) { const selectedTypeData = dashboardDataStore.leaveBalance[selectedTypeId]; const balance = selectedTypeData.quota - selectedTypeData.used; balanceInput.value = `${balance} วัน`; } else { balanceInput.value = `-`; } }
+    
+    function createApprovalCard(task) {
+        const card = document.createElement('div');
+        card.className = 'approval-card';
+        card.id = `card-${task.requestId}`;
+        
+        let rejectFn, approveFn;
+        if (task.type === 'leave') {
+            rejectFn = (currentUser.role === 'HR') ? 'finalizeRejection' : 'rejectLeaveRequest';
+            approveFn = (currentUser.role === 'HR') ? 'finalizeApproval' : 'approveLeaveRequest';
+        } else { // 'ot'
+            rejectFn = (currentUser.role === 'HR') ? 'finalizeOTRejection' : 'rejectOTRequest';
+            approveFn = (currentUser.role === 'HR') ? 'finalizeOTApproval' : 'approveOTRequest';
+        }
+
+        card.innerHTML = `
+        <div class="card-header">${task.employeeName} <span>(${task.leaveType})</span></div>
+        <div class="card-body">
+            <p><strong><i class="fas fa-calendar-alt"></i> วันที่/เวลา:</strong> ${task.startDate}</p>
+            ${task.type === 'leave' ? `<p><strong><i class="fas fa-calendar-day"></i> ถึง:</strong> ${task.endDate}</p>` : `<p><strong><i class="fas fa-clock"></i> เวลา:</strong> ${task.endDate}</p>`}
+        </div>
+        <div class="card-actions">
+            <button class="btn-reject" onclick="handleAction('${rejectFn}', '${task.requestId}', this)"><i class="fas fa-times"></i> ปฏิเสธ</button>
+            <button class="btn-approve" onclick="handleAction('${approveFn}', '${task.requestId}', this)"><i class="fas fa-check"></i> อนุมัติ</button>
+        </div>`;
+        return card;
+    }
+    
+    function switchView(viewName) {
+        document.getElementById('my-dashboard-content').style.display = 'none';
+        document.getElementById('hr-panel-content').style.display = 'none';
+        document.getElementById('leave-history-content').style.display = 'none';
+
+        if (viewName === 'myDashboard') { document.getElementById('my-dashboard-content').style.display = 'block'; } 
+        else if (viewName === 'leaveHistory') { document.getElementById('leave-history-content').style.display = 'block'; loadHistory(); } 
+        else if (viewName === 'hrPanel') { document.getElementById('hr-panel-content').style.display = 'block'; loadHRManagementData(); }
+
+        document.querySelectorAll('.view-btn').forEach(btn => btn.classList.remove('active'));
+        const sidebarBtn = document.getElementById(`btn-${viewName}`);
+        if (sidebarBtn) sidebarBtn.classList.add('active');
+        const mobileBtn = document.getElementById(`btn-mobile-${viewName}`);
+        if (mobileBtn) mobileBtn.classList.add('active');
+    }
+
+    function toggleFabMenu() { document.getElementById('fab-container').classList.toggle('active'); }
+    function openLeaveRequestModal() { document.getElementById('leave-request-modal').style.display = 'flex'; toggleFabMenu(); }
+    function closeLeaveRequestModal() { document.getElementById('leave-request-modal').style.display = 'none'; }
+    function openOTRequestModal() { document.getElementById('ot-request-modal').style.display = 'flex'; toggleFabMenu(); }
+    function closeOTRequestModal() { document.getElementById('ot-request-modal').style.display = 'none'; }
+
+    function handleSubmitLeave() {
+        const submitBtn = document.getElementById('submit-leave-btn');
+        const leaveData = { leaveTypeID: document.getElementById('leave-type').value, startDate: document.getElementById('start-date').value, endDate: document.getElementById('end-date').value, reason: document.getElementById('leave-reason').value };
+        if (!leaveData.startDate || !leaveData.endDate || !leaveData.reason) { Swal.fire('ข้อมูลไม่ครบ', 'กรุณากรอกข้อมูลการลาให้ครบถ้วน', 'warning'); return; }
+        if (new Date(leaveData.endDate) < new Date(leaveData.startDate)) { Swal.fire('วันที่ไม่ถูกต้อง', 'วันที่สิ้นสุดต้องไม่มาก่อนวันที่เริ่ม', 'warning'); return; }
+        const fileInput = document.getElementById('leave-attachment');
+        const file = fileInput.files[0];
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = `<div class="button-spinner"></div> กำลังส่ง...`;
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = e => {
+                const fileObject = { base64Data: e.target.result.split(',')[1], mimeType: file.type, fileName: file.name };
+                google.script.run.withSuccessHandler(onSubmitSuccess).withFailureHandler(onSubmitFailure).submitLeaveRequestWithAttachment(sessionToken, leaveData, fileObject);
+            };
+            reader.onerror = error => onSubmitFailure({message: "ไม่สามารถอ่านไฟล์ได้: " + error});
+            reader.readAsDataURL(file);
+        } else {
+            google.script.run.withSuccessHandler(onSubmitSuccess).withFailureHandler(onSubmitFailure).submitLeaveRequest(sessionToken, leaveData);
+        }
+    }
+    
+    function onSubmitSuccess(response) { 
+        const submitBtn = document.getElementById('submit-leave-btn');
+        submitBtn.disabled = false; submitBtn.innerHTML = 'ส่งใบลา';
+        if (response.success) { 
+            Swal.fire({ icon: 'success', title: 'สำเร็จ', text: response.message, timer: 2500, showConfirmButton: false }); 
+            closeLeaveRequestModal(); 
+            document.getElementById('start-date').value = ''; document.getElementById('end-date').value = ''; document.getElementById('leave-reason').value = ''; 
+            document.getElementById('leave-attachment').value = ''; updateFileName(document.getElementById('leave-attachment'));
+            loadInitialData(true); 
+        } else { Swal.fire('ผิดพลาด', response.message, 'error'); } 
+    }
+    
+    function handleSubmitOT() {
+        const submitBtn = document.getElementById('submit-ot-btn');
+        const otData = { otDate: document.getElementById('ot-date').value, startTime: document.getElementById('ot-start-time').value, endTime: document.getElementById('ot-end-time').value, reason: document.getElementById('ot-reason').value };
+        if (!otData.otDate || !otData.startTime || !otData.endTime || !otData.reason) { Swal.fire('ข้อมูลไม่ครบ', 'กรุณากรอกข้อมูล OT ให้ครบถ้วน', 'warning'); return; }
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = `<div class="button-spinner"></div> กำลังบันทึก...`;
+        google.script.run.withSuccessHandler(response => {
+            submitBtn.disabled = false; submitBtn.innerHTML = 'บันทึก OT';
+            if (response.success) {
+                Swal.fire({ icon: 'success', title: 'สำเร็จ', text: response.message, timer: 2500, showConfirmButton: false });
+                closeOTRequestModal();
+                document.getElementById('ot-date').value = ''; document.getElementById('ot-start-time').value = ''; document.getElementById('ot-end-time').value = ''; document.getElementById('ot-reason').value = '';
+            } else { Swal.fire('ผิดพลาด', response.message, 'error'); }
+        }).withFailureHandler(err => {
+            submitBtn.disabled = false; submitBtn.innerHTML = 'บันทึก OT';
+            Swal.fire('ผิดพลาดรุนแรง', err.message, 'error');
+        }).submitOTRequest(sessionToken, otData);
+    }
+
+    function handleAction(actionFunction, requestId, buttonElement) {
+        const cardActions = buttonElement.parentElement; const originalButtonsHtml = {};
+        Array.from(cardActions.children).forEach(btn => { originalButtonsHtml[btn.className] = btn.innerHTML; btn.disabled = true; btn.innerHTML = `<div class="button-spinner"></div>`; });
+        google.script.run.withSuccessHandler(response => { 
+            if (response.success) { 
+                Swal.fire({ icon: 'success', title: 'สำเร็จ', text: response.message, timer: 2000, showConfirmButton: false }); loadInitialData(true); 
+            } else { 
+                Swal.fire('ผิดพลาด', response.message, 'error'); 
+                Array.from(cardActions.children).forEach(btn => { btn.disabled = false; btn.innerHTML = originalButtonsHtml[btn.className]; });
+            } 
+        }).withFailureHandler(err => { 
+            Swal.fire('ผิดพลาดรุนแรง', err.message, 'error'); 
+            Array.from(cardActions.children).forEach(btn => { btn.disabled = false; btn.innerHTML = originalButtonsHtml[btn.className]; });
+        })[actionFunction](sessionToken, requestId); 
+    }
+
+    function renderNotificationsBadge(notifications) { allUserNotifications = notifications; const unreadCount = allUserNotifications.filter(n => n.status === 'Unread').length; const badge = document.getElementById('notification-badge'); badge.style.display = unreadCount > 0 ? 'flex' : 'none'; badge.textContent = unreadCount > 9 ? '9+' : unreadCount; }
+    function onSubmitFailure(error) { const submitBtn = document.getElementById('submit-leave-btn'); submitBtn.disabled = false; submitBtn.innerHTML = 'ส่งใบลา'; Swal.fire('ผิดพลาดรุนแรง', error.message, 'error'); }
+    
+    function handleLogout() {
+        const logoutButtons = document.querySelectorAll('.logout-action-btn');
+        logoutButtons.forEach(btn => {
+            btn.disabled = true;
+            if (btn.querySelector('.menu-text')) {
+                btn.querySelector('.menu-text').textContent = 'กำลังออก...';
+            } else { 
+                btn.innerHTML = '<div class="button-spinner"></div>';
+            }
+        });
+        google.script.run.withSuccessHandler(onLogoutSuccess).logoutUser(sessionToken); 
+    }
+    
+    function onLogoutSuccess(){ localStorage.removeItem('leaveAppSessionToken'); google.script.run.withSuccessHandler(url => { window.top.location.replace(url); }).getScriptUrl(); }
+    
+    function openNotificationInbox() {
+        const inboxList = document.getElementById('notifications-inbox-list');
+        const footer = document.getElementById('notifications-inbox-footer');
+        inboxList.innerHTML = '';
+        
+        if (allUserNotifications.length === 0) {
+            inboxList.innerHTML = '<p style="opacity: 0.7; text-align:center;">ไม่มีข้อความในกล่องจดหมาย</p>';
+            footer.style.display = 'none';
+        } else {
+            const notificationsToDisplay = allUserNotifications.slice(0, 5);
+            notificationsToDisplay.forEach(n => {
+                const item = document.createElement('div');
+                item.className = `notification-item-inbox ${n.status === 'Unread' ? 'unread' : ''}`;
+                item.innerHTML = `<div class="msg-content">${n.message}</div><div class="msg-date">${n.createdDate}</div>`;
+                inboxList.appendChild(item);
+            });
+
+            if (allUserNotifications.length > 5) {
+                footer.style.display = 'block';
+            } else {
+                footer.style.display = 'none';
+            }
+        }
+        
+        document.getElementById('notification-modal').style.display = 'flex';
+        const unreadIds = allUserNotifications.filter(n => n.status === 'Unread').map(n => n.notificationId);
+        if (unreadIds.length > 0) {
+            google.script.run.withSuccessHandler(() => { document.getElementById('notification-badge').style.display = 'none'; allUserNotifications.forEach(n => { if (unreadIds.includes(n.notificationId)) n.status = 'Read'; }); }).markNotificationsAsRead(sessionToken, unreadIds);
+        }
+    }
+    
+    function renderAllNotifications() {
+        const inboxList = document.getElementById('notifications-inbox-list');
+        const footer = document.getElementById('notifications-inbox-footer');
+        inboxList.innerHTML = '';
+        allUserNotifications.forEach(n => {
+            const item = document.createElement('div');
+            item.className = `notification-item-inbox ${n.status === 'Unread' ? 'unread' : ''}`;
+            item.innerHTML = `<div class="msg-content">${n.message}</div><div class="msg-date">${n.createdDate}</div>`;
+            inboxList.appendChild(item);
+        });
+        footer.style.display = 'none';
+    }
+    
+    function closeNotificationInbox() { document.getElementById('notification-modal').style.display = 'none'; }
+    function showSpinner() { const spinner = document.getElementById('spinner-overlay'); if (spinner) spinner.style.display = 'flex'; }
+    function hideSpinner() { const spinner = document.getElementById('spinner-overlay'); if (spinner) spinner.style.display = 'none'; }
+    function openChangePasswordModal() { document.getElementById('change-password-form').innerHTML = ` <div> <label for="old-password">รหัสผ่านปัจจุบัน</label> <input type="password" id="old-password"> </div> <div class="form-grid"> <div> <label for="new-password">รหัสผ่านใหม่</label> <input type="password" id="new-password"> </div> <div> <label for="confirm-password">ยืนยันรหัสผ่านใหม่</label> <input type="password" id="confirm-password"> </div> </div> <button id="change-pass-btn" onclick="executeChangePassword()"><i class="fas fa-save"></i> บันทึกรหัสผ่านใหม่</button> `; document.getElementById('change-password-modal').style.display = 'flex'; }
+    function closeChangePasswordModal() { document.getElementById('change-password-modal').style.display = 'none'; }
+    
+    function executeChangePassword() { 
+        const oldPassword = document.getElementById('old-password').value; const newPassword = document.getElementById('new-password').value; const confirmPassword = document.getElementById('confirm-password').value; const changeBtn = document.getElementById('change-pass-btn');
+        if (!oldPassword || !newPassword || !confirmPassword) { Swal.fire('ข้อมูลไม่ครบ', 'กรุณากรอกข้อมูลให้ครบทุกช่อง', 'warning'); return; } 
+        if (newPassword !== confirmPassword) { Swal.fire('รหัสผ่านไม่ตรงกัน', 'กรุณากรอกรหัสผ่านใหม่และยืนยันให้ตรงกัน', 'warning'); return; } 
+        if (newPassword.length < 6) { Swal.fire('รหัสผ่านสั้นไป', 'รหัสผ่านใหม่ต้องมีความยาวอย่างน้อย 6 ตัวอักษร', 'warning'); return; } 
+        changeBtn.disabled = true; changeBtn.innerHTML = `<div class="button-spinner"></div> กำลังบันทึก...`;
+        google.script.run.withSuccessHandler(response => { 
+            changeBtn.disabled = false; changeBtn.innerHTML = `<i class="fas fa-save"></i> บันทึกรหัสผ่านใหม่`;
+            Swal.fire({ icon: response.success ? 'success' : 'error', text: response.message, timer: 2500, showConfirmButton: false }); 
+            if (response.success) { closeChangePasswordModal(); } 
+        }).withFailureHandler(err => { 
+            changeBtn.disabled = false; changeBtn.innerHTML = `<i class="fas fa-save"></i> บันทึกรหัสผ่านใหม่`;
+            Swal.fire('ผิดพลาดรุนแรง', err.message, 'error'); 
+        }).changeUserPassword(sessionToken, oldPassword, newPassword); 
+    }
+    
+    function loadHistory(forceRefresh = false) {
+        if (historyCache && !forceRefresh) { renderHistory(historyCache); return; }
+        showSpinner();
+        google.script.run.withSuccessHandler(response => {
+            hideSpinner();
+            if(response.success){ historyCache = response; renderHistory(response); } 
+            else { Swal.fire('ผิดพลาด', 'ไม่สามารถโหลดประวัติได้', 'error'); }
+        }).withFailureHandler(err => { hideSpinner(); Swal.fire('ผิดพลาดรุนแรง', err.message, 'error'); }).getHistory(sessionToken);
+    }
+
+    function renderHistory(data) {
+        renderHistoryTable('leave-history-list', data.leaveHistory, ['วันที่ยื่น', 'ประเภท', 'ช่วงวันที่ลา', 'จำนวน', 'สถานะ']);
+        renderHistoryTable('ot-history-list', data.otHistory, ['วันที่ทำ OT', 'ประเภท', 'เวลา', 'จำนวน', 'สถานะ']);
+    }
+
+    function renderHistoryTable(elementId, historyData, headers) {
+        const listDiv = document.getElementById(elementId);
+        let tableHTML = `<div class="table-wrapper"><table class="data-table"><thead><tr>`;
+        headers.forEach(h => tableHTML += `<th>${h}</th>`);
+        tableHTML += `</tr></thead><tbody>`;
+
+        if(historyData && historyData.length > 0) {
+            historyData.forEach(item => {
+                const statusClass = item.statusClass.includes('Pending') ? 'Pending' : (item.statusClass || 'default');
+                tableHTML += `<tr><td>${item.requestDate}</td><td>${item.type}</td><td>${item.dateRange}</td><td>${item.total}</td><td><span class="status-badge status-${statusClass}">${item.status}</span></td></tr>`;
+            });
+        } else {
+            tableHTML += `<tr><td colspan="${headers.length}" style="text-align:center; opacity:0.7;">ไม่มีประวัติ</td></tr>`;
+        }
+        tableHTML += '</tbody></table></div>';
+        listDiv.innerHTML = tableHTML;
+    }
+
+    function loadHRManagementData(forceRefresh = false) { if (hrManagementDataCache && !forceRefresh) { populateDepartmentFilter(hrManagementDataCache.departments); applyHRFilters(); return; } showSpinner(); google.script.run .withSuccessHandler(response => { hideSpinner(); if(response.success){ hrManagementDataCache = response; populateDepartmentFilter(hrManagementDataCache.departments); applyHRFilters(); } else { Swal.fire('ผิดพลาด', response.message, 'error'); } }).withFailureHandler(err => { hideSpinner(); Swal.fire('ผิดพลาดรุนแรง', err.message, 'error'); }).getHRManagementData(sessionToken); }
+    
+    function populateDepartmentFilter(departments) { const filterSelect = document.getElementById('department-filter'); filterSelect.innerHTML = '<option value="all">ทุกแผนก</option>'; departments.sort().forEach(dept => { filterSelect.innerHTML += `<option value="${dept}">${dept}</option>`; }); }
+    
+    function applyHRFilters() { const roleFilter = document.getElementById('role-filter').value; const deptFilter = document.getElementById('department-filter').value; const filteredEmployees = hrManagementDataCache.employees.filter(emp => emp.EmploymentStatus === 'Active' && (roleFilter === 'all' || emp.Role === roleFilter) && (deptFilter === 'all' || emp.Department === deptFilter) ); renderEmployeeList(filteredEmployees); }
+    
+    function renderEmployeeList(employees) { const listDiv = document.getElementById('employee-list-for-hr'); let tableHTML = `<div class="table-wrapper"><table class="data-table"> <thead><tr><th>ชื่อ-นามสกุล</th><th>ตำแหน่ง</th><th>แผนก</th><th>จัดการ</th></tr></thead><tbody>`; if(employees.length > 0){ employees.forEach(emp => { tableHTML += `<tr> <td>${emp.FullName}</td><td>${emp.Role}</td><td>${emp.Department || '-'}</td> <td><button class="btn-edit" onclick='openEmployeeModal(false, ${JSON.stringify(emp)})'><i class="fas fa-pencil-alt"></i> แก้ไข</button></td> </tr>`; }); } else { tableHTML += `<tr><td colspan="4" style="text-align:center; opacity: 0.7;">ไม่พบข้อมูลพนักงานตามที่กรอง</td></tr>`; } tableHTML += '</tbody></table></div>'; listDiv.innerHTML = tableHTML; }
+    
+    function createEmployeeFormHTML(isNew, employee = {}) { let deptOptions = hrManagementDataCache.departments.map(d => `<option value="${d}" ${employee.Department === d ? 'selected': ''}>${d}</option>`).join(''); return ` ${isNew ? `<div class="form-grid"><div><label>รหัสพนักงาน (ID):</label><input type="text" id="emp-id" placeholder="e.g., EMP008"></div><div><label>Username (สำหรับ Login):</label><input type="text" id="emp-username" placeholder="e.g., first.l"></div></div>` : ''} <div class="form-grid" style="grid-template-columns: 1fr 2fr 2fr;"><div><label>คำนำหน้า:</label><select id="emp-title"><option>นาย</option><option>นาง</option><option>นางสาว</option></select></div><div><label>ชื่อจริง:</label><input type="text" id="emp-firstname" value="${employee.FirstName || ''}"></div><div><label>นามสกุล:</label><input type="text" id="emp-lastname" value="${employee.LastName || ''}"></div></div> <label>ชื่อเล่น:</label><input type="text" id="emp-nickname" value="${employee.Nickname || ''}"> <hr class="form-divider"> <div class="form-grid"><div><label>ตำแหน่ง:</label><select id="emp-role"><option value="Employee">Employee</option><option value="Supervisor">Supervisor</option><option value="Manager">Manager</option><option value="HR">HR</option></select></div><div><label>แผนก:</label><select id="emp-department" onchange="setupDynamicManagerDropdown(this.value, '')"><option value="">--เลือกแผนก--</option>${deptOptions}</select></div></div> <label>หัวหน้า (ManagerID):</label><select id="emp-managerid"></select> <div class="form-grid"><div><label>วันเริ่มงาน:</label><input type="date" id="emp-startdate" value="${employee.StartDate ? new Date(employee.StartDate).toISOString().split('T')[0] : ''}"></div><div><label>สถานะการทำงาน:</label><select id="emp-status"><option value="Active">Active</option><option value="Resigned">Resigned</option></select></div></div> <hr class="form-divider"> <h4>โควต้าวันลาพื้นฐาน (ต่อปี)</h4> <div class="form-grid"><div><label>โควต้าลาป่วย:</label><input type="number" id="emp-quota-sick" value="${employee.Quota_LT001 || 30}"></div><div><label>โควต้าลากิจ:</label><input type="number" id="emp-quota-business" value="${employee.Quota_LT002 || 7}"></div><div><label>โควต้าลาพักร้อน:</label><input type="number" id="emp-quota-vacation" value="${employee.Quota_LT003 || 6}"></div></div> <button id="employee-form-btn" onclick="${isNew ? 'executeAddNewEmployee()' : `executeSaveEmployeeData('${employee.EmployeeID}')`}"><i class="fas fa-save"></i> ${isNew ? 'เพิ่มพนักงาน' : 'บันทึกการเปลี่ยนแปลง'}</button> `; }
+    
+    function setupDynamicManagerDropdown(selectedDept, selectedManager) { const managerSelect = document.getElementById('emp-managerid'); managerSelect.innerHTML = '<option value="">ไม่มี</option>'; hrManagementDataCache.managers.filter(m => m.department === selectedDept).forEach(m => { managerSelect.innerHTML += `<option value="${m.id}" ${m.id === selectedManager ? 'selected' : ''}>${m.name}</option>`; }); }
+    
+    function openEmployeeModal(isNew, employee = {}) { document.getElementById('employee-modal-header').innerText = isNew ? "เพิ่มพนักงานใหม่" : `แก้ไขข้อมูล: ${employee.FullName}`; document.getElementById('employee-modal-form').innerHTML = createEmployeeFormHTML(isNew, employee); document.getElementById('employee-modal').style.display = 'flex'; if(!isNew) { document.getElementById('emp-title').value = employee.Title; document.getElementById('emp-role').value = employee.Role; document.getElementById('emp-department').value = employee.Department; document.getElementById('emp-status').value = employee.EmploymentStatus; setupDynamicManagerDropdown(employee.Department, employee.ManagerID); } }
+    
+    function closeEmployeeModal() { document.getElementById('employee-modal').style.display = 'none'; }
+    
+    function executeSaveEmployeeData(employeeId) { 
+        const saveBtn = document.getElementById('employee-form-btn'); const originalHtml = saveBtn.innerHTML; saveBtn.disabled = true; saveBtn.innerHTML = `<div class="button-spinner"></div> กำลังบันทึก...`;
+        const updatedData = { EmployeeID: employeeId, Title: document.getElementById('emp-title').value, FirstName: document.getElementById('emp-firstname').value, LastName: document.getElementById('emp-lastname').value, Nickname: document.getElementById('emp-nickname').value, Role: document.getElementById('emp-role').value, Department: document.getElementById('emp-department').value, ManagerID: document.getElementById('emp-managerid').value, StartDate: document.getElementById('emp-startdate').value, EmploymentStatus: document.getElementById('emp-status').value, Quota_LT001: document.getElementById('emp-quota-sick').value, Quota_LT002: document.getElementById('emp-quota-business').value, Quota_LT003: document.getElementById('emp-quota-vacation').value }; 
+        google.script.run.withSuccessHandler(response => { 
+            saveBtn.disabled = false; saveBtn.innerHTML = originalHtml;
+            Swal.fire({icon: response.success ? 'success' : 'error', text: response.message, timer: 2500, showConfirmButton: false}); 
+            if(response.success){ closeEmployeeModal(); loadHRManagementData(true); } 
+        }).withFailureHandler(err => { 
+            saveBtn.disabled = false; saveBtn.innerHTML = originalHtml;
+            Swal.fire('ผิดพลาดรุนแรง', err.message, 'error'); 
+        }).updateEmployeeData(sessionToken, updatedData); 
+    }
+    
+    function executeAddNewEmployee() { 
+        const addBtn = document.getElementById('employee-form-btn'); const originalHtml = addBtn.innerHTML;
+        const newData = { EmployeeID: document.getElementById('emp-id').value, Username: document.getElementById('emp-username').value, Title: document.getElementById('emp-title').value, FirstName: document.getElementById('emp-firstname').value, LastName: document.getElementById('emp-lastname').value, Nickname: document.getElementById('emp-nickname').value, Role: document.getElementById('emp-role').value, Department: document.getElementById('emp-department').value, ManagerID: document.getElementById('emp-managerid').value, StartDate: document.getElementById('emp-startdate').value, EmploymentStatus: document.getElementById('emp-status').value, Quota_LT001: document.getElementById('emp-quota-sick').value, Quota_LT002: document.getElementById('emp-quota-business').value, Quota_LT003: document.getElementById('emp-quota-vacation').value }; 
+        if(!newData.EmployeeID || !newData.Username || !newData.FirstName || !newData.LastName){ Swal.fire('ข้อมูลไม่ครบ', 'กรุณากรอกรหัสพนักงาน, Username, ชื่อและนามสกุล', 'warning'); return; } 
+        addBtn.disabled = true; addBtn.innerHTML = `<div class="button-spinner"></div> กำลังเพิ่ม...`;
+        google.script.run.withSuccessHandler(response => { 
+            addBtn.disabled = false; addBtn.innerHTML = originalHtml;
+            Swal.fire({ icon: response.success ? 'success' : 'error', title: response.success ? 'เพิ่มพนักงานสำเร็จ!' : 'ผิดพลาด', html: response.message.replace(/\n/g, '<br>'), }); 
+            if(response.success){ closeEmployeeModal(); loadHRManagementData(true); } 
+        }).withFailureHandler(err => { 
+            addBtn.disabled = false; addBtn.innerHTML = originalHtml;
+            Swal.fire('ผิดพลาดรุนแรง', err.message, 'error'); 
+        }).addNewEmployee(sessionToken, newData); 
+    }
+
+    function updateFileName(input) {
+        const fileNameDisplay = document.getElementById('file-name-display');
+        if (input.files.length > 0) { fileNameDisplay.textContent = input.files[0].name; } 
+        else { fileNameDisplay.textContent = 'ยังไม่ได้เลือกไฟล์'; }
+    }
+</script>
